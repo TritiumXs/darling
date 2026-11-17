@@ -1,0 +1,161 @@
+# Shared build + publish logic for the CI, Nightly and Stable release channels.
+# Called by ci.yml / nightly.yml / stable.yml; not triggered on its own.
+#
+# Build matrix notes:
+#   * amd64: native x86-64 build; CMakeLists.txt defaults to TARGET_i386=ON,
+#     so the tree carries both x86 (i386) and amd64 (x86-64) slices. A pure
+#     32-bit host build is impossible: CMakeLists.txt rejects i686/i386 hosts
+#     and debian/control only ships amd64/arm64 packages.
+#   * arm64: native aarch64 build on an ARM runner (no cross toolchain needed).
+#   * Windows: intentionally not built. Darling is a Linux-only runtime (Mach-O
+#     loader + darling-mach kernel module + Linux syscalls); producing Windows
+#     binaries is not possible without modifying the code, so there is no job.
+name: Build and publish (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: Release channel, one of ci, nightly, stable
+        required: true
+        type: string
+      version:
+        description: Build version string used in logs and release notes
+        required: true
+        type: string
+      release_tag:
+        description: GitHub Release / tag to publish assets into
+        required: true
+        type: string
+      release_name:
+        description: Title of the GitHub Release
+        required: true
+        type: string
+      prerelease:
+        description: Mark the Release as a prerelease
+        required: false
+        default: true
+        type: boolean
+      publish:
+        description: Whether to upload assets to the GitHub Release
+        required: false
+        default: true
+        type: boolean
+      build_rpm:
+        description: Whether to run the (best-effort) RPM packaging job
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout Darling
+        uses: actions/checkout@v4
+
+      # Submodules, build dependencies, disk cleanup and ccache config all
+      # live in script/ci-setup.sh (submodules fetched in parallel).
+      - name: Setup (submodules, dependencies, ccache)
+        run: bash script/ci-setup.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-release-${{ matrix.arch }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-release-${{ matrix.arch }}-main-
+            ccache-release-${{ matrix.arch }}-
+
+      # Build, copy out the installed output, and build DEBs by reusing
+      # tools/debian/make-deb. All in script/ci-build-linux.sh; artifacts
+      # are emitted into dist/.
+      - name: Build, copy output and package DEBs
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash script/ci-build-linux.sh
+
+      # Save even on failure so a late failure still leaves object files.
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-release-${{ matrix.arch }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  # RPM packaging is best effort and reuses the repository's own rpm/
+  # directory: script/ci-build-rpm.sh builds rpm/Dockerfile (which installs
+  # RPM Fusion and bootstraps BuildRequires) and runs rpm/build.bsh inside it.
+  rpm:
+    name: Build RPM packages (amd64, best effort)
+    if: inputs.build_rpm
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Darling
+        uses: actions/checkout@v4
+
+      # build.bsh tars up /src, so submodules must be populated first. The
+      # container mount is read-only, so fetch them on the host.
+      - name: Checkout submodules
+        run: bash script/ci-checkout-submodules.sh
+
+      - name: Build RPMs (rpm/Dockerfile + build.bsh)
+        run: bash script/ci-build-rpm.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-amd64
+          path: ${{ runner.temp }}/rpms/
+          if-no-files-found: warn
+
+  publish:
+    name: Publish to Release
+    # The linux build must succeed; the RPM job is best effort and may be
+    # skipped (nightly) or fail without blocking publication.
+    needs: [linux, rpm]
+    if: ${{ inputs.publish && needs.linux.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Darling
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      # Prefix assets by channel and publish into the target Release. All in
+      # script/ci-publish.sh. CI and Nightly coexist in one rolling Release.
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+        run: bash script/ci-publish.sh
